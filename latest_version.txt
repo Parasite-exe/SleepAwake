@@ -1,1 +1,764 @@
+import customtkinter as ctk
+from tkinter import messagebox
+import sys
+import os
+import time
+import subprocess
+import tempfile
+import datetime
+from PIL import Image
+import requests
+import json
 
+# ========= Resource helpers (works in dev + PyInstaller + Nuitka) =========
+def resource_path(*parts):
+    """Return absolute path to a bundled resource (works in dev + PyInstaller + Nuitka)."""
+    # PyInstaller creates a temp folder and sets sys._MEIPASS to its path.
+    # Nuitka, in --onefile mode, unpacks to a temporary directory. The best way
+    # to handle assets is to include the entire directory.
+    # We will use the base path of the script's directory.
+    base = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base, *parts)
+
+def safe_iconbitmap(win, path):
+    """Set window icon safely; never crash if missing/invalid."""
+    try:
+        if path and os.path.exists(path):
+            # Tkinter's iconbitmap requires a .ico file
+            win.iconbitmap(path)
+    except Exception as e:
+        print(f"Icon error: {e}")
+
+# ====== Paths & CTk setup (NO chdir) ======
+ICON_PATH      = resource_path("assets", "your_icon.ico")
+BG_MAIN_PATH   = resource_path("assets", "shutdown_bg2.png")
+BG_INPUT_PATH  = resource_path("assets", "starttimerbackground.png")
+BG_SCHED_PATH  = resource_path("assets", "shutdown_bg3.png")
+TIME_BG_PATH   = resource_path("assets", "Time.png")
+
+# ====== Font paths ======
+VERA_TTF_PATH  = resource_path("assets", "Vera Humana 95 Bold.ttf")
+GIZA_TTF_PATH  = resource_path("assets", "Giza.otf")
+CARDO_TTF_PATH = resource_path("assets", "Cardo-Regular.ttf")
+
+# ====== Load fonts for this process ======
+try:
+    import ctypes
+    FR_PRIVATE = 0x10
+    # Add fonts to the system so they can be used by CTkinter
+    for _font_path in (VERA_TTF_PATH, GIZA_TTF_PATH, CARDO_TTF_PATH):
+        if _font_path and os.path.exists(_font_path):
+            try:
+                ctypes.windll.gdi32.AddFontResourceExW(_font_path, FR_PRIVATE, 0)
+            except Exception as e:
+                print(f"Font load warning [{_font_path}]: {e}")
+        else:
+            print(f"Font not found: {_font_path}")
+except Exception as e:
+    print(f"Font autoload error: {e}")
+    
+ctk.set_appearance_mode("dark")
+ctk.set_default_color_theme("green")
+
+# ====== Global state ======
+# Change this to match your current version number!
+CURRENT_VERSION = "1.2" 
+
+# URL where you will host a file with the latest version number, like 'latest_version.txt'
+# This has been corrected to the "raw" file URL for GitHub.
+VERSION_CHECK_URL = "https://raw.githubusercontent.com/Parasite-exe/SleepAwake/main/latest_version.txt" 
+
+remaining_time_window = None
+update_timer_id = None
+shutdown_time = None  # None or epoch seconds when shutdown will occur
+wake_scheduled = False  # True if a wake task is scheduled
+action_mode = None  # "shutdown" or "wake"
+dev_info_window = None  # About window handle
+
+# Background images & labels
+bg_main_img = None
+bg_input_img = None
+bg_sched_img = None
+bg_main_label = None
+bg_input_label = None
+bg_sched_label = None
+
+# ====== Root window ======
+root = ctk.CTk()
+root.title("SleepAwake Timer")
+root.geometry("338x388")  # Startup / Reset / wake-only(No)
+root.resizable(False, False)
+safe_iconbitmap(root, ICON_PATH)
+root.configure(fg_color="#242424")
+
+# ====== Fonts ======
+FONT_TITLE = ctk.CTkFont(family="Vera Humana 95 Bold", size=24, weight="bold")
+FONT_BUTTON = ctk.CTkFont(family="Vera Humana 95 Bold", size=19, weight="bold")
+FONT_LABEL = ctk.CTkFont(family="Vera Humana 95 Bold", size=17)
+
+# ====== Background helpers ======
+def hide_all_bgs():
+    if bg_main_label:
+        bg_main_label.place_forget()
+    if bg_input_label:
+        bg_input_label.place_forget()
+    if bg_sched_label:
+        bg_sched_label.place_forget()
+
+def show_bg_main_menu_default():
+    """Startup / Reset / ONLY wake (No) → 338x388 + shutdown_bg2.png"""
+    hide_all_bgs()
+    if bg_main_label:
+        bg_main_label.place(x=0, y=0, relwidth=1, relheight=1)
+    root.geometry("338x388")
+
+def show_bg_input_screen():
+    """Input screen (Turn Off / Turn On) → 338x328 + starttimerbackground.png"""
+    hide_all_bgs()
+    if bg_input_label:
+        bg_input_label.place(x=0, y=0, relwidth=1, relheight=1)
+    root.geometry("338x328")
+
+def show_bg_shutdown_active():
+    """ONLY shutdown OR shutdown + wake → 338x443 + shutdown_bg3.png"""
+    hide_all_bgs()
+    if bg_sched_label:
+        bg_sched_label.place(x=0, y=0, relwidth=1, relheight=1)
+    root.geometry("338x443")
+
+def apply_menu_bg_by_state():
+    """
+    - If ONLY shutdown set (shutdown_time not None) → 338x443 + bg3
+    - If ONLY wake set (wake_scheduled True but no shutdown) → 338x388 + bg2
+    - If both set (shutdown_time not None and wake_scheduled True) → 338x443 + bg3
+    - Else (none) → 338x388 + bg2
+    """
+    if shutdown_time is not None:
+        show_bg_shutdown_active()
+    elif wake_scheduled:
+        show_bg_main_menu_default()
+    else:
+        show_bg_main_menu_default()
+
+# ====== Actions ======
+def check_for_updates():
+    """Checks a remote URL to see if a new version is available."""
+    try:
+        response = requests.get(VERSION_CHECK_URL, timeout=5)
+        response.raise_for_status() # Raises an HTTPError if the status code is 4xx or 5xx
+
+        # Assuming the file contains just the version number, like "1.1"
+        latest_version = response.text.strip()
+        
+        # Compare versions
+        if latest_version > CURRENT_VERSION:
+            messagebox.showinfo(
+                "Update Available", 
+                f"A new version ({latest_version}) is available. "
+                f"Your current version is {CURRENT_VERSION}. "
+                "Visit the website to download the latest version."
+            )
+        else:
+            messagebox.showinfo(
+                "No Updates", 
+                f"You are running the latest version ({CURRENT_VERSION})."
+            )
+            
+    except requests.exceptions.RequestException as e:
+        messagebox.showerror(
+            "Update Check Failed", 
+            f"Could not check for updates. Please check your internet connection.\n\nError: {e}"
+        )
+
+def shutdown_now():
+    os.system("shutdown /s /t 0")
+
+def shutdown_timer():
+    """Schedule Windows shutdown (ONLY shutdown case)."""
+    global shutdown_time
+    try:
+        hours = int(entry_hour.get())
+        minutes = int(entry_minute.get())
+        total_seconds = (hours * 3600) + (minutes * 60)
+
+        if total_seconds <= 0:
+            messagebox.showerror("Invalid Input", "Please enter a time greater than zero.")
+            return
+        if total_seconds > 315_360_000:
+            messagebox.showerror("Invalid Input", "Time is too large for Windows shutdown timer.")
+            return
+
+        # Abort any previous pending shutdown (ignore failures)
+        try:
+            subprocess.run(
+                ["shutdown", "/a"],
+                capture_output=True,
+                text=True,
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
+
+        # Schedule shutdown with correct flags
+        proc = subprocess.run(
+            ["shutdown", "/s", "/t", str(total_seconds)],
+            capture_output=True,
+            text=True,
+            shell=False,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        if proc.returncode != 0:
+            err = (proc.stderr or proc.stdout or "").strip()
+            raise RuntimeError(err if err else "shutdown.exe returned a non-zero exit code")
+
+        messagebox.showinfo(
+            "Shutdown Scheduled", f"Your PC will shut down in {hours} hours and {minutes} minutes."
+        )
+        shutdown_time = time.time() + total_seconds
+        button_shutdown.configure(state="disabled")
+
+        # Back to menu with correct look (shutdown present → 338x443 + bg3)
+        finish_input_and_show_menu()
+
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Please enter valid numbers for hours and minutes.")
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to schedule shutdown:\n{e}")
+
+def reset_timer():
+    """Cancel all timers and return to default main menu (338x388 + bg2)."""
+    global shutdown_time, wake_scheduled
+    shutdown_time = None
+    subprocess.run(
+        ["shutdown", "/a"],
+        shell=False,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    try:
+        subprocess.run(
+            ["schtasks", "/Delete", "/TN", "SleepAwakeWake", "/F"],
+            capture_output=True,
+            text=True,
+            shell=False,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+    except Exception:
+        pass
+    wake_scheduled = False
+    button_shutdown.configure(state="normal")
+    button_time_remaining.pack_forget()
+    stop_remaining_time_display()
+    show_bg_main_menu_default()
+    messagebox.showinfo("Timer Reset", "SleepAwake timers have been reset.")
+
+def dev_info():
+    """Open a dedicated 'About' window above the main app (modal-like)."""
+    global dev_info_window
+
+    # If already open, bring to front
+    if dev_info_window and dev_info_window.winfo_exists():
+        dev_info_window.lift()
+        dev_info_window.focus_force()
+        return
+
+    # Create the window
+    dev_info_window = ctk.CTkToplevel(root)
+    dev_info_window.title("About SleepAwake")
+    dev_info_window.resizable(False, False)
+    dev_info_window.configure(fg_color="#242424")
+
+    # Force it above the root window (modal behavior)
+    dev_info_window.lift()
+    dev_info_window.focus_force()
+    dev_info_window.grab_set()  # keep on top until closed
+
+    # === Window size/position ===
+    w, h = 320, 180
+    try:
+        root.update_idletasks()
+        x = root.winfo_x() + (root.winfo_width() // 2) - (w // 2)
+        y = root.winfo_y() + (root.winfo_height() // 2) - (h // 2)
+        dev_info_window.geometry(f"{w}x{h}+{x}+{y}")
+    except Exception:
+        dev_info_window.geometry(f"{w}x{h}")
+
+    # Set icon a moment later (avoids some toolkit quirks)
+    dev_info_window.after(250, lambda: safe_iconbitmap(dev_info_window, ICON_PATH))
+
+    # Content
+    title_lbl = ctk.CTkLabel(
+        dev_info_window,
+        text="SleepAwake",
+        font=ctk.CTkFont(size=22, weight="bold"),
+    )
+    title_lbl.pack(pady=(16, 6))
+
+    body_lbl = ctk.CTkLabel(
+        dev_info_window,
+        text=(
+            "Developer: Anik Mazumder Turno\n"
+            "Buy Me Coffee\n"
+            "Email: aniikmazumder@gmail.com"
+        ),
+        justify="center",
+        font=ctk.CTkFont(size=14),
+        fg_color="transparent",
+    )
+    body_lbl.pack(padx=16, pady=(0, 10))
+
+    # Buttons row
+    btn_row = ctk.CTkFrame(dev_info_window, fg_color="transparent")
+    btn_row.pack(pady=10)
+
+    def copy_email():
+        dev_info_window.clipboard_clear()
+        dev_info_window.clipboard_append("aniikmazumder@gmail.com")
+
+    def close_about():
+        global dev_info_window
+        try:
+            dev_info_window.grab_release()
+        except Exception:
+            pass
+        if dev_info_window and dev_info_window.winfo_exists():
+            dev_info_window.destroy()
+        dev_info_window = None
+
+    copy_btn = ctk.CTkButton(
+        btn_row,
+        text="Copy Email",
+        width=120,
+        command=copy_email,
+        font=ctk.CTkFont(family="Cardo", size=17, weight="bold"),
+        fg_color="#616161",
+        hover_color="#454545",
+    )
+    copy_btn.grid(row=0, column=0, padx=8)
+
+    close_btn = ctk.CTkButton(
+        btn_row,
+        text="Close",
+        width=100,
+        command=close_about,
+        font=ctk.CTkFont(family="Cardo", size=17, weight="bold"),
+        fg_color="#616161",
+        hover_color="#454545",
+    )
+    close_btn.grid(row=0, column=1, padx=8)
+
+    # Proper cleanup on window [X]
+    dev_info_window.protocol("WM_DELETE_WINDOW", close_about)
+
+def exit_program():
+    stop_remaining_time_display()
+    root.destroy()
+
+def show_timer_inputs(mode="shutdown"):
+    """Open the input screen for shutdown or wake."""
+    global action_mode
+    action_mode = mode
+    hide_main_menu_widgets()
+    show_bg_input_screen()
+    if action_mode == "shutdown":
+        button_start_action.configure(text="Start SleepAwake", command=shutdown_timer)
+    else:
+        button_start_action.configure(
+            text="Schedule Wake", command=schedule_wake_then_optionally_hibernate
+        )
+    back_button.place(x=0, y=0)
+    label_hour.pack(pady=(50, 5))
+    entry_hour.pack(pady=5)
+    label_minute.pack(pady=5)
+    entry_minute.pack(pady=5)
+    button_start_action.pack(pady=20)
+
+def finish_input_and_show_menu():
+    """Hide input widgets and show the main menu with the correct background/geometry."""
+    back_button.place_forget()
+    label_hour.pack_forget()
+    entry_hour.pack_forget()
+    label_minute.pack_forget()
+    entry_minute.pack_forget()
+    button_start_action.pack_forget()
+    apply_menu_bg_by_state()
+    show_main_menu_widgets()
+
+def go_back():
+    """If user presses Back from input, decide menu by current timers."""
+    finish_input_and_show_menu()
+
+# ====== Time Remaining popup ======
+def update_timer_display(label):
+    global update_timer_id, shutdown_time
+    if shutdown_time is None:
+        label.configure(text="Timer not set.")
+        return
+    remaining_seconds = int(shutdown_time - time.time())
+    if remaining_seconds <= 0:
+        label.configure(text="Shutdown is imminent...")
+        shutdown_now()
+        stop_remaining_time_display()
+        return
+    hours = remaining_seconds // 3600
+    minutes = (remaining_seconds % 3600) // 60
+    seconds = remaining_seconds % 60
+    label.configure(
+        text=f"Time Remaining: {hours:02d}h {minutes:02d}m {seconds:02d}s"
+    )
+    update_timer_id = root.after(1000, lambda: update_timer_display(label))
+
+def show_time_remaining():
+    global remaining_time_window, update_timer_id
+    if remaining_time_window and remaining_time_window.winfo_exists():
+        remaining_time_window.lift()
+        return
+
+    remaining_time_window = ctk.CTkToplevel(root)
+    remaining_time_window.title("Time Remaining")
+    remaining_time_window.resizable(False, False)
+    remaining_time_window.geometry("300x150")  # <-- The Time Remaining window geometry
+    remaining_time_window.configure(fg_color="#242424")
+
+    # Set icon a moment later to avoid toolkit overrides
+    remaining_time_window.after(250, lambda: safe_iconbitmap(remaining_time_window, ICON_PATH))
+
+    # --- Time Remaining background image ---
+    try:
+        img = Image.open(TIME_BG_PATH).resize((300, 150), Image.Resampling.LANCZOS)
+        remaining_time_window.time_bg_img = ctk.CTkImage(
+            light_image=img, dark_image=img, size=(300, 150)
+        )
+        remaining_time_window.time_bg_label = ctk.CTkLabel(
+            remaining_time_window, text="", image=remaining_time_window.time_bg_img
+        )
+        remaining_time_window.time_bg_label.place(x=0, y=0, relwidth=1, relheight=1)
+    except Exception as e:
+        print(f"Error loading Time Remaining background: {e}")
+
+    timer_label = ctk.CTkLabel(
+        remaining_time_window,
+        text="",
+        font=ctk.CTkFont(size=16, weight="bold"),
+    )
+    timer_label.pack(pady=20)
+
+    cancel_button = ctk.CTkButton(
+        remaining_time_window,
+        text="Cancel SleepAwake",
+        font=ctk.CTkFont(family="Vera Humana 95 Bold", size=18, weight="bold"),
+        command=lambda: [reset_timer(), remaining_time_window.destroy()],
+    )
+    cancel_button.pack(pady=10)
+
+    update_timer_display(timer_label)
+    remaining_time_window.protocol("WM_DELETE_WINDOW", stop_remaining_time_display)
+
+def stop_remaining_time_display():
+    global remaining_time_window, update_timer_id
+    if update_timer_id:
+        root.after_cancel(update_timer_id)
+    update_timer_id = None
+    if remaining_time_window and remaining_time_window.winfo_exists():
+        remaining_time_window.destroy()
+
+# ====== Wake scheduling ======
+def try_enable_wake_timers():
+    cmds = [
+        ["powercfg", "-setacvalueindex", "SCHEME_CURRENT", "SUB_SLEEP", "STWAKE", "1"],
+        ["powercfg", "-setdcvalueindex", "SCHEME_CURRENT", "SUB_SLEEP", "STWAKE", "1"],
+        ["powercfg", "-setactive", "SCHEME_CURRENT"],
+    ]
+    for cmd in cmds:
+        try:
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                shell=False,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+        except Exception:
+            pass
+
+def create_wake_task(task_name: str, wake_dt: datetime.datetime):
+    start_boundary = wake_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    task_xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>SleepAwake wake timer</Description>
+    <Author>SleepAwake</Author>
+  </RegistrationInfo>
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>{start_boundary}</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <WakeToRun>true</WakeToRun>
+    <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>cmd.exe</Command>
+      <Arguments>/c exit</Arguments>
+    </Exec>
+  </Actions>
+</Task>"""
+    xml_path = os.path.join(tempfile.gettempdir(), "SleepAwakeWake.xml")
+    with open(xml_path, "w", encoding="utf-16") as f:
+        f.write(task_xml)
+    result = subprocess.run(
+        ["schtasks", "/Create", "/TN", task_name, "/XML", xml_path, "/F"],
+        capture_output=True,
+        text=True,
+        shell=False,
+        creationflags=subprocess.CREATE_NO_WINDOW
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Failed to create scheduled task.")
+
+def schedule_wake_then_optionally_hibernate():
+    """
+    Wake flow (Button 2):
+      - Schedule wake (wake_scheduled=True if success)
+      - Ask "Turn Off Now?"
+          - Yes → hibernate now
+          - No  → return to menu:
+                      * ONLY wake → 338x388 + bg2
+                      * shutdown already set too → 338x443 + bg3
+    """
+    global wake_scheduled
+    try:
+        hours = int(entry_hour.get())
+        minutes = int(entry_minute.get())
+        total_seconds = (hours * 3600) + (minutes * 60)
+        if total_seconds <= 0:
+            messagebox.showerror("Invalid Input", "Please enter a time greater than zero.")
+            return
+    except ValueError:
+        messagebox.showerror("Invalid Input", "Please enter valid numbers for hours and minutes.")
+        return
+
+    wake_dt = datetime.datetime.now() + datetime.timedelta(seconds=total_seconds)
+    try:
+        try_enable_wake_timers()
+        create_wake_task("SleepAwakeWake", wake_dt)
+        wake_scheduled = True
+    except Exception as e:
+        messagebox.showerror(
+            "Wake Timer Error",
+            "Couldn't schedule the wake timer.\n"
+            "Please run as Administrator and ensure Task Scheduler is available.\n\n"
+            f"Details:\n{e}",
+        )
+        return
+
+    messagebox.showinfo(
+        "Wake Scheduled",
+        f"Your PC is scheduled to wake at {wake_dt.strftime('%Y-%m-%d %H:%M:%S')}.",
+    )
+
+    choice = messagebox.askyesno(
+        "Turn Off Now?",
+        "Do you want to Turn Off the PC Immediately?\n\n"
+        "Note: We use Hibernate so the PC can wake itself.",
+    )
+    if choice:
+        try:
+            stop_remaining_time_display()
+        except Exception:
+            pass
+        os.system("shutdown /h")
+    else:
+        finish_input_and_show_menu()
+
+# ====== Load backgrounds ======
+def load_bg(path, size):
+    try:
+        img = Image.open(path).resize(size, Image.Resampling.LANCZOS)
+        return ctk.CTkImage(light_image=img, dark_image=img, size=size)
+    except Exception as e:
+        print(f"Error loading {path}: {e}")
+        return None
+
+bg_main_img = load_bg(BG_MAIN_PATH, (338, 388))
+bg_input_img = load_bg(BG_INPUT_PATH, (338, 328))
+bg_sched_img = load_bg(BG_SCHED_PATH, (338, 443))
+
+if bg_main_img:
+    bg_main_label = ctk.CTkLabel(root, text="", image=bg_main_img)
+if bg_input_img:
+    bg_input_label = ctk.CTkLabel(root, text="", image=bg_input_img)
+if bg_sched_img:
+    bg_sched_label = ctk.CTkLabel(root, text="", image=bg_sched_img)
+
+# ====== Main UI ======
+show_bg_main_menu_default()
+title_label = ctk.CTkLabel(
+    root, text="SleepAwake Timer", font=("Giza", 30), fg_color="transparent"
+)
+
+button_shutdown = ctk.CTkButton(
+    root,
+    text="Turn Off PC After",
+    fg_color="#2d2d2d",
+    hover_color="#454545",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=lambda: show_timer_inputs("shutdown"),
+)
+button_turn_on_after = ctk.CTkButton(
+    root,
+    text="Turn On PC After",
+    fg_color="#2d2d2d",
+    hover_color="#454545",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=lambda: show_timer_inputs("wake"),
+)
+button_time_remaining = ctk.CTkButton(
+    root,
+    text="Time Remaining",
+    fg_color="#2d2d2d",
+    hover_color="#454545",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=show_time_remaining,
+)
+button_reset = ctk.CTkButton(
+    root,
+    text="Reset SleepAwake",
+    fg_color="#2d2d2d",
+    hover_color="#454545",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=reset_timer,
+)
+button_dev_info = ctk.CTkButton(
+    root,
+    text="Dev Info",
+    fg_color="#2d2d2d",
+    hover_color="#454545",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=dev_info,
+)
+button_exit = ctk.CTkButton(
+    root,
+    text="Exit",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=exit_program,
+    fg_color="#a8362d",
+    hover_color="#ac4c43",
+)
+
+# New update button
+button_update = ctk.CTkButton(
+    root,
+    text="Check for Updates",
+    font=FONT_BUTTON,
+    width=175,
+    height=40,
+    command=check_for_updates,
+    fg_color="#536976", # A new color to differentiate
+    hover_color="#718792",
+)
+
+
+def show_main_menu_widgets():
+    title_label.pack(pady=(10, 20))
+    button_shutdown.pack(pady=10)
+    button_turn_on_after.pack(pady=10)
+    if shutdown_time is not None:
+        button_time_remaining.pack(pady=10)
+    button_reset.pack(pady=10)
+    button_update.pack(pady=10) # Position the new button
+    button_dev_info.pack(pady=10)
+    button_exit.pack(pady=10)
+
+
+def hide_main_menu_widgets():
+    for w in [
+        title_label,
+        button_shutdown,
+        button_turn_on_after,
+        button_time_remaining,
+        button_reset,
+        button_dev_info,
+        button_exit,
+        button_update, # Make sure to hide the new button too
+    ]:
+        w.pack_forget()
+
+show_main_menu_widgets()
+
+# ====== Input widgets ======
+back_button = ctk.CTkButton(
+    root,
+    text="< Back",
+    font=FONT_BUTTON,
+    width=30,
+    fg_color="#454545",
+    hover_color="#797979",
+    height=30,
+    command=go_back,
+)
+FONT_LABEL_BIG = ctk.CTkFont(family="Vera Humana 95 Bold", size=20)
+label_hour = ctk.CTkLabel(root, text="Hour:", font=FONT_LABEL_BIG, fg_color="transparent")
+entry_hour = ctk.CTkEntry(
+    root, font=FONT_LABEL_BIG, fg_color="#3e3e3e", corner_radius=10
+)
+label_minute = ctk.CTkLabel(
+    root, text="Minute:", font=FONT_LABEL_BIG, fg_color="transparent"
+)
+entry_minute = ctk.CTkEntry(
+    root, font=FONT_LABEL_BIG, fg_color="#3e3e3e", corner_radius=10
+)
+button_start_action = ctk.CTkButton(
+    root,
+    text="Start SleepAwake",
+    font=FONT_BUTTON,
+    fg_color="#3B753C",
+    hover_color="#66BB6A",
+    command=shutdown_timer,
+)
+
+# === Nuitka Compilation Command ===
+# To create a single, standalone executable that includes all
+# assets and the correct Tkinter plugin, use this command.
+#
+# IMPORTANT: Make sure the file path for `--windows-icon` is correct
+# and points to your actual .ico file. For example, if your icon is
+# named 'app_icon.ico' inside the 'assets' folder, the command should be:
+#
+# nuitka --standalone --onefile --disable-console --include-data-dir=assets=assets --enable-plugin=tk-inter --windows-icon=assets/your_icon.ico --include-package=requests SleepAwake.py
+#
+# Remember to run this command from the directory where SleepAwake.py is located.
+
+root.mainloop()
